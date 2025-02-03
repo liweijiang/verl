@@ -4,10 +4,10 @@ python3 -m verl.trainer.main_ppo \
     data.train_files=data/panorama/rl/train.parquet \
     data.val_files=data/panorama/rl/val.parquet \
     data.train_batch_size=1024 \
-    data.val_batch_size=1312 \
+    data.val_batch_size=1024 \
     data.max_prompt_length=512 \
-    data.max_response_length=512 \
-    actor_rollout_ref.model.path=deepseek-ai/deepseek-llm-7b-chat \
+    data.max_response_length=1024 \
+    actor_rollout_ref.model.path= \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
@@ -24,7 +24,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
-    critic.model.path=deepseek-ai/deepseek-llm-7b-chat \
+    critic.model.path=meta-llama/Llama-3.2-3B-Instruct \
     critic.model.enable_gradient_checkpointing=True \
     critic.ppo_micro_batch_size_per_gpu=32 \
     critic.model.fsdp_config.param_offload=False \
@@ -42,7 +42,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_epochs=15 $@
 
 
-# meta-llama/Llama-3.1-8B
+# meta-llama/Llama-3.1-8B-Instruct
 
 
 
