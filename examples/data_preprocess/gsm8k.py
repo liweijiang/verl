@@ -76,6 +76,7 @@ if __name__ == '__main__':
                     "question": question_raw,
                 }
             }
+            print(data)
             return data
 
         return process_fn
