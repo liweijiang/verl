@@ -720,7 +720,7 @@ class RayPPOTrainer(object):
                         batch.batch['token_level_scores'] = reward_tensor
 
                         # compute rewards. apply_kl_penalty if available
-                        # TO MYSELF: we do not apply kl penalty her for GRPO
+                        # TO MYSELF: we do not apply kl penalty here for GRPO
                         if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
                             batch, kl_metrics = apply_kl_penalty(batch,
                                                                  kl_ctrl=self.kl_ctrl,
