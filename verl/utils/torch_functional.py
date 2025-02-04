@@ -128,11 +128,25 @@ def masked_var(values, mask, unbiased=True):
 
 
 def masked_whiten(values, mask, shift_mean=True):
-    """Whiten values with masked values."""
+    """Normalize values by subtracting mean and dividing by standard deviation, while respecting the mask.
+    
+    Whitening is a preprocessing technique that transforms the input data to have:
+    1. Zero mean (by subtracting the mean)
+    2. Unit variance (by dividing by standard deviation)
+    This helps stabilize training by standardizing the scale of the values.
+
+    Args:
+        values: Input tensor to be whitened
+        mask: Binary mask tensor indicating which values to include in statistics
+        shift_mean: If True, center data to zero mean. If False, preserve original mean.
+
+    Returns:
+        Whitened tensor with same shape as input values
+    """
     mean, var = masked_mean(values, mask), masked_var(values, mask)
-    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
+    whitened = (values - mean) * torch.rsqrt(var + 1e-8)  # Divide by std dev with numerical stability
     if not shift_mean:
-        whitened += mean
+        whitened += mean  # Restore original mean if requested
     return whitened
 
 
@@ -357,6 +371,25 @@ from transformers.generation.logits_process import (TemperatureLogitsWarper, Top
 
 
 def post_process_logits(input_ids, logits, temperature, top_k, top_p):
+    """Post-process logits by applying temperature scaling and (optionally) top-k/top-p sampling.
+    
+    This function modifies the logits distribution by:
+    1. Dividing by a temperature value to make the distribution sharper (temperature < 1) 
+       or smoother (temperature > 1)
+    2. (Currently disabled) Optionally applying top-k filtering to keep only the k highest probability tokens
+    3. (Currently disabled) Optionally applying nucleus/top-p sampling to keep the minimum set of tokens
+       whose cumulative probability exceeds p
+    
+    Args:
+        input_ids: Input token IDs
+        logits: Raw logits from the model
+        temperature: Temperature for scaling logits. Lower values make distribution more peaked.
+        top_k: (Disabled) If > 0, keep only top k tokens with highest probability
+        top_p: (Disabled) If < 1.0, keep minimum number of tokens to exceed this cumulative probability
+        
+    Returns:
+        Processed logits with temperature scaling applied
+    """
     if temperature != 1.:
         logits = logits.div_(temperature)  # inplace operation to avoid OOM
     # TODO: add them back

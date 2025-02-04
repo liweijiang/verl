@@ -125,6 +125,7 @@ def main_task(config, compute_score=None):
     tokenizer = hf_tokenizer(local_path)
 
     # define worker classes
+    # TO MYSELF: fsdp is chosen for default
     if config.actor_rollout_ref.actor.strategy == 'fsdp':
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
         from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
@@ -165,6 +166,7 @@ def main_task(config, compute_score=None):
     # - finally, we combine all the rewards together
     # - The reward type depends on the tag of the data
     if config.reward_model.enable:
+        # TO MYSELF: fsdp is chosen for default
         if config.reward_model.strategy == 'fsdp':
             from verl.workers.fsdp_workers import RewardModelWorker
         elif config.reward_model.strategy == 'megatron':

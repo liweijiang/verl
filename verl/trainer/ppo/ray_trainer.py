@@ -16,6 +16,8 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+from verl.utils.torch_functional import masked_mean
+import torch
 import os
 import uuid
 from contextlib import contextmanager
@@ -59,7 +61,8 @@ class ResourcePoolManager:
     """
     resource_pool_spec: dict[str, list[int]]
     mapping: dict[Role, str]
-    resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+    resource_pool_dict: dict[str, RayResourcePool] = field(
+        default_factory=dict)
 
     def create_resource_pool(self):
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
@@ -77,11 +80,18 @@ class ResourcePoolManager:
         return self.resource_pool_dict[self.mapping[role]]
 
 
-import torch
-from verl.utils.torch_functional import masked_mean
-
-
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
+    """
+    Apply KL penalty to adjust the token-level rewards based on the KL divergence between the reference policy and the current policy.
+
+    Args:
+        data (DataProto): The data containing batch information including responses, scores, and log probabilities.
+        kl_ctrl (core_algos.AdaptiveKLController): The KL controller used to adjust the KL coefficient.
+        kl_penalty (str): The type of KL penalty to apply. Default is 'kl'.
+
+    Returns:
+        Tuple[DataProto, dict]: The updated data with adjusted token-level rewards and a dictionary of metrics.
+    """
     responses = data.batch['responses']
     response_length = responses.size(1)
     token_level_scores = data.batch['token_level_scores']
@@ -91,17 +101,28 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
     # compute kl between ref_policy and current policy
     if 'ref_log_prob' in data.batch.keys():
-        kld = core_algos.kl_penalty(data.batch['old_log_probs'], data.batch['ref_log_prob'],
+        kld = core_algos.kl_penalty(data.batch['old_log_probs'],
+                                    data.batch['ref_log_prob'],
                                     kl_penalty=kl_penalty)  # (batch_size, response_length)
+        print("*" * 100)
+        print("kld: ", kld.shape)
+        print("*" * 100)
         kld = kld * response_mask
+        print("*" * 100)
+        print("kld * response_mask: ", (kld * response_mask).shape)
+        print("*" * 100)
         beta = kl_ctrl.value
+        print("*" * 100)
+        print("beta: ", beta)
+        print("*" * 100)
     else:
         beta = 0
         kld = torch.zeros_like(response_mask, dtype=torch.float32)
 
     token_level_rewards = token_level_scores - beta * kld
 
-    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
+    current_kl = masked_mean(kld, mask=response_mask,
+                             axis=-1)  # average over sequence
     current_kl = torch.mean(current_kl, dim=0).item()
 
     # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
@@ -179,8 +200,10 @@ def compute_data_metrics(batch, use_critic=True):
 
     max_response_length = batch.batch['responses'].shape[-1]
 
-    prompt_mask = batch.batch['attention_mask'][:, :-max_response_length].bool()
-    response_mask = batch.batch['attention_mask'][:, -max_response_length:].bool()
+    prompt_mask = batch.batch['attention_mask'][:,
+                                                :-max_response_length].bool()
+    response_mask = batch.batch['attention_mask'][:, -
+                                                  max_response_length:].bool()
 
     max_prompt_length = prompt_mask.size(-1)
 
@@ -243,7 +266,8 @@ def compute_data_metrics(batch, use_critic=True):
         'response_length/min':
             torch.min(response_length).detach().item(),
         'response_length/clip_ratio':
-            torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
+            torch.mean(torch.eq(response_length,
+                       max_response_length).float()).detach().item(),
         # prompt length
         'prompt_length/mean':
             torch.mean(prompt_length).detach().item(),
@@ -252,7 +276,8 @@ def compute_data_metrics(batch, use_critic=True):
         'prompt_length/min':
             torch.min(prompt_length).detach().item(),
         'prompt_length/clip_ratio':
-            torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+            torch.mean(
+                torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
     return metrics
 
@@ -303,7 +328,9 @@ class RayPPOTrainer(object):
                  ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
                  reward_fn=None,
                  val_reward_fn=None):
-
+        """
+        Initialize the trainer.
+        """
         # assert torch.cuda.is_available(), 'cuda must be available on driver'
 
         self.tokenizer = tokenizer
@@ -326,7 +353,8 @@ class RayPPOTrainer(object):
         # define KL control
         if self.use_reference_policy:
             if config.algorithm.kl_ctrl.type == 'fixed':
-                self.kl_ctrl = core_algos.FixedKLController(kl_coef=config.algorithm.kl_ctrl.kl_coef)
+                self.kl_ctrl = core_algos.FixedKLController(
+                    kl_coef=config.algorithm.kl_ctrl.kl_coef)
             elif config.algorithm.kl_ctrl.type == 'adaptive':
                 assert config.algorithm.kl_ctrl.horizon > 0, f'horizon must be larger than 0. Got {config.critic.kl_ctrl.horizon}'
                 self.kl_ctrl = core_algos.AdaptiveKLController(init_kl_coef=config.algorithm.kl_ctrl.kl_coef,
@@ -341,47 +369,18 @@ class RayPPOTrainer(object):
         self._create_dataloader()
 
     def _validate_config(self):
+        """
+        Validate the config.
+        """
         from verl.utils.config import validate_config
         validate_config(self.config)
 
-    def _create_dataloader(self):
-        from torch.utils.data import DataLoader
-        # TODO: we have to make sure the batch size is divisible by the dp size
-        from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
-        self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
-                                         tokenizer=self.tokenizer,
-                                         prompt_key=self.config.data.prompt_key,
-                                         max_prompt_length=self.config.data.max_prompt_length,
-                                         filter_prompts=True,
-                                         return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                         truncation='error')
-        self.train_dataloader = DataLoader(dataset=self.train_dataset,
-                                           batch_size=self.config.data.train_batch_size,
-                                           shuffle=True,
-                                           drop_last=True,
-                                           collate_fn=collate_fn)
-
-        self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
-                                       tokenizer=self.tokenizer,
-                                       prompt_key=self.config.data.prompt_key,
-                                       max_prompt_length=self.config.data.max_prompt_length,
-                                       filter_prompts=True,
-                                       return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                       truncation='error')
-        self.val_dataloader = DataLoader(dataset=self.val_dataset,
-                                         batch_size=len(self.val_dataset),
-                                         shuffle=True,
-                                         drop_last=True,
-                                         collate_fn=collate_fn)
-
-        assert len(self.train_dataloader) >= 1
-        assert len(self.val_dataloader) >= 1
-
-        print(f'Size of train dataloader: {len(self.train_dataloader)}')
-        print(f'Size of val dataloader: {len(self.val_dataloader)}')
-
-        # inject total_training_steps to actor/critic optim_config. This is hacky.
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+    def _set_total_training_steps(self):
+        """
+        Inject total_training_steps to actor/critic optim_config. This is hacky.
+        """
+        total_training_steps = len(
+            self.train_dataloader) * self.config.trainer.total_epochs
 
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
@@ -394,7 +393,52 @@ class RayPPOTrainer(object):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
 
+    def _create_dataloader(self):
+        """
+        Create the dataloader.
+        """
+        from torch.utils.data import DataLoader
+        # TODO: we have to make sure the batch size is divisible by the dp size
+        from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+        self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
+                                         tokenizer=self.tokenizer,
+                                         prompt_key=self.config.data.prompt_key,
+                                         max_prompt_length=self.config.data.max_prompt_length,
+                                         filter_prompts=True,
+                                         return_raw_chat=self.config.data.get(
+                                             'return_raw_chat', False),
+                                         truncation='error')
+        self.train_dataloader = DataLoader(dataset=self.train_dataset,
+                                           batch_size=self.config.data.train_batch_size,
+                                           shuffle=True,
+                                           drop_last=True,
+                                           collate_fn=collate_fn)
+
+        self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
+                                       tokenizer=self.tokenizer,
+                                       prompt_key=self.config.data.prompt_key,
+                                       max_prompt_length=self.config.data.max_prompt_length,
+                                       filter_prompts=True,
+                                       return_raw_chat=self.config.data.get(
+                                           'return_raw_chat', False),
+                                       truncation='error')
+        self.val_dataloader = DataLoader(dataset=self.val_dataset,
+                                         batch_size=len(self.val_dataset),
+                                         shuffle=True,
+                                         drop_last=True,
+                                         collate_fn=collate_fn)
+
+        assert len(self.train_dataloader) >= 1
+        assert len(self.val_dataloader) >= 1
+
+        print(f'Size of train dataloader: {len(self.train_dataloader)}')
+        print(f'Size of val dataloader: {len(self.val_dataloader)}')
+        self._set_total_training_steps()
+
     def _validate(self):
+        """
+        Validate the model on the validation set.
+        """
         reward_tensor_lst = []
         data_source_lst = []
         for test_data in self.val_dataloader:
@@ -405,7 +449,8 @@ class RayPPOTrainer(object):
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
                 return {}
 
-            test_gen_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
+            test_gen_batch = test_batch.pop(
+                ['input_ids', 'attention_mask', 'position_ids'])
             test_gen_batch.meta_info = {
                 'eos_token_id': self.tokenizer.eos_token_id,
                 'pad_token_id': self.tokenizer.pad_token_id,
@@ -415,10 +460,13 @@ class RayPPOTrainer(object):
             }
 
             # pad to be divisible by dp_size
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(
+                test_gen_batch, self.actor_rollout_wg.world_size)
+            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(
+                test_gen_batch_padded)
             # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            test_output_gen_batch = unpad_dataproto(
+                test_output_gen_batch_padded, pad_size=pad_size)
             print('validation generation end')
 
             test_batch = test_batch.union(test_output_gen_batch)
@@ -428,9 +476,11 @@ class RayPPOTrainer(object):
             reward_tensor = self.val_reward_fn(test_batch)
 
             reward_tensor_lst.append(reward_tensor)
-            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+            data_source_lst.append(test_batch.non_tensor_batch.get(
+                'data_source', ['unknown'] * reward_tensor.shape[0]))
 
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
+        reward_tensor = torch.cat(
+            reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
         # evaluate test_score based on data source
         data_source_reward = {}
@@ -447,14 +497,18 @@ class RayPPOTrainer(object):
         return metric_dict
 
     def init_workers(self):
-        """Init resource pool and worker group"""
+        """
+        Initialize the resource pool and worker groups.
+        """
         self.resource_pool_manager.create_resource_pool()
 
-        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+        self.resource_pool_to_cls = {
+            pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # create actor and rollout
         if self.hybrid_engine:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            resource_pool = self.resource_pool_manager.get_resource_pool(
+                Role.ActorRollout)
             actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.ActorRollout],
                                                      config=self.config.actor_rollout_ref,
                                                      role='actor_rollout')
@@ -464,8 +518,10 @@ class RayPPOTrainer(object):
 
         # create critic
         if self.config.algorithm.adv_estimator == 'gae':
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
+            resource_pool = self.resource_pool_manager.get_resource_pool(
+                Role.Critic)
+            critic_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
             self.use_critic = True
         elif self.config.algorithm.adv_estimator == 'grpo':
@@ -475,7 +531,8 @@ class RayPPOTrainer(object):
 
         # create reference policy if needed
         if self.use_reference_policy:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+            resource_pool = self.resource_pool_manager.get_resource_pool(
+                Role.RefPolicy)
             ref_policy_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RefPolicy],
                                                   config=self.config.actor_rollout_ref,
                                                   role='ref')
@@ -484,8 +541,10 @@ class RayPPOTrainer(object):
         # create a reward model if reward_fn is None
         if self.use_rm:
             # we create a RM here
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
+            resource_pool = self.resource_pool_manager.get_resource_pool(
+                Role.RewardModel)
+            rm_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool]['rm'] = rm_cls
 
         # initialize WorkerGroup
@@ -495,9 +554,12 @@ class RayPPOTrainer(object):
         all_wg = {}
         self.wg_dicts = []
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-            wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls)
+            worker_dict_cls = create_colocated_worker_cls(
+                class_dict=class_dict)
+            wg_dict = self.ray_worker_group_cls(
+                resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls)
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+
             all_wg.update(spawn_wg)
             # keep the referece of WorkerDict to support ray >= 2.31. Ref: https://github.com/ray-project/ray/pull/45699
             self.wg_dicts.append(wg_dict)
@@ -523,26 +585,30 @@ class RayPPOTrainer(object):
                                         f'global_step_{self.global_steps}')
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
             self.config.trainer.default_hdfs_dir, 'actor')
-        self.actor_rollout_wg.save_checkpoint(actor_local_path, actor_remote_path)
+        self.actor_rollout_wg.save_checkpoint(
+            actor_local_path, actor_remote_path)
 
         if self.use_critic:
             critic_local_path = os.path.join(self.config.trainer.default_local_dir, 'critic',
                                              f'global_step_{self.global_steps}')
             critic_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
                 self.config.trainer.default_hdfs_dir, 'critic')
-            self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
+            self.critic_wg.save_checkpoint(
+                critic_local_path, critic_remote_path)
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch['attention_mask']
         batch_size = attention_mask.shape[0]
-        global_seqlen_lst = batch.batch['attention_mask'].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
+        global_seqlen_lst = batch.batch['attention_mask'].view(
+            batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
         world_size = self.actor_rollout_wg.world_size
         global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst,
                                                               k_partitions=world_size,
                                                               equal_size=True)
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
-        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+        global_idx = torch.tensor(
+            [j for partition in global_partition_lst for j in partition])
         batch.reorder(global_idx)
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst,
                                                     partitions=global_partition_lst,
@@ -585,17 +651,27 @@ class RayPPOTrainer(object):
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
-                gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+                gen_batch = batch.pop(
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'])
 
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        gen_batch_output = self.actor_rollout_wg.generate_sequences(
+                            gen_batch)
+
+                        # decode responses if indicated
+                        if self.config.actor_rollout_ref.rollout.decode_responses:
+                            gen_batch_decoded_responses = self.tokenizer.batch_decode(
+                                gen_batch_output.batch['responses'], skip_special_tokens=True)
+                        else:
+                            gen_batch_decoded_responses = None
 
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    batch = batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
                     # balance the number of valid tokens on each dp rank.
@@ -604,20 +680,24 @@ class RayPPOTrainer(object):
                     self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
-                    batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
+                    batch.meta_info['global_token_num'] = torch.sum(
+                        batch.batch['attention_mask'], dim=-1).tolist()
 
                     # recompute old_log_probs
                     with _timer('old_log_prob', timing_raw):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(
+                            batch)
                         batch = batch.union(old_log_prob)
 
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(
+                                batch)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
+                    # TO MYSELF: critic is turned off for GRPO
                     if self.use_critic:
                         with _timer('values', timing_raw):
                             values = self.critic_wg.compute_values(batch)
@@ -630,6 +710,9 @@ class RayPPOTrainer(object):
                         if self.use_rm:
                             # we first compute reward model score
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            # # print number of non-zero entries along last dimension
+                            # print(f"Number of non-zero reward entries: {(reward_tensor.batch['rm_scores'] != 0).sum(dim=-1)}")
+                            # print(f"Number of non-zero reward entries: {(reward_tensor.batch['rm_scores'] != 0).sum(dim=-1).shape}")
                             batch = batch.union(reward_tensor)
 
                         # we combine with rule-based rm
@@ -637,7 +720,8 @@ class RayPPOTrainer(object):
                         batch.batch['token_level_scores'] = reward_tensor
 
                         # compute rewards. apply_kl_penalty if available
-                        if not self.config.actor_rollout_ref.actor.use_kl_loss:
+                        # TO MYSELF: we do not apply kl penalty her for GRPO
+                        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
                             batch, kl_metrics = apply_kl_penalty(batch,
                                                                  kl_ctrl=self.kl_ctrl,
                                                                  kl_penalty=self.config.algorithm.kl_penalty)
@@ -656,20 +740,23 @@ class RayPPOTrainer(object):
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
                             critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+                        critic_output_metrics = reduce_metrics(
+                            critic_output.meta_info['metrics'])
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer('update_actor', timing_raw):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                            actor_output = self.actor_rollout_wg.update_actor(
+                                batch)
+                        actor_output_metrics = reduce_metrics(
+                            actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
-                        self.global_steps % self.config.trainer.test_freq == 0:
+                            self.global_steps % self.config.trainer.test_freq == 0:
                         with _timer('testing', timing_raw):
                             val_metrics: dict = self._validate()
                         metrics.update(val_metrics)
@@ -680,8 +767,10 @@ class RayPPOTrainer(object):
                             self._save_checkpoint()
 
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                metrics.update(compute_data_metrics(
+                    batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_timing_metrics(
+                    batch=batch, timing_raw=timing_raw))
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
