@@ -14,7 +14,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=128 \  # 64 for 8B
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=128 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.5 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -66,6 +66,6 @@ python3 -m verl.trainer.main_ppo \
 
     # reward_model.model.path=sfairXC/FsfairX-LLaMA3-RM-v0.1 \
     # reward_model.model.input_tokenizer=sfairXC/FsfairX-LLaMA3-RM-v0.1 \
-
+#   64 for 8B
 
 
