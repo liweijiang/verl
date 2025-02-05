@@ -104,17 +104,8 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
         kld = core_algos.kl_penalty(data.batch['old_log_probs'],
                                     data.batch['ref_log_prob'],
                                     kl_penalty=kl_penalty)  # (batch_size, response_length)
-        print("*" * 100)
-        print("kld: ", kld.shape)
-        print("*" * 100)
         kld = kld * response_mask
-        print("*" * 100)
-        print("kld * response_mask: ", (kld * response_mask).shape)
-        print("*" * 100)
         beta = kl_ctrl.value
-        print("*" * 100)
-        print("beta: ", beta)
-        print("*" * 100)
     else:
         beta = 0
         kld = torch.zeros_like(response_mask, dtype=torch.float32)
@@ -642,6 +633,7 @@ class RayPPOTrainer(object):
 
         # we start from step 1
         self.global_steps += 1
+        records = {"global_step": [], "raw_prompt": [], "decoded_response": [], "rm_score": []}
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -652,7 +644,7 @@ class RayPPOTrainer(object):
 
                 # pop those keys for generation
                 gen_batch = batch.pop(
-                    batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'])  # , 'raw_prompt'
 
                 with _timer('step', timing_raw):
                     # generate a batch
@@ -662,10 +654,18 @@ class RayPPOTrainer(object):
 
                         # decode responses if indicated
                         if self.config.actor_rollout_ref.rollout.decode_responses:
-                            gen_batch_decoded_responses = self.tokenizer.batch_decode(
+                            batch_decoded_responses = self.tokenizer.batch_decode(
                                 gen_batch_output.batch['responses'], skip_special_tokens=True)
                         else:
-                            gen_batch_decoded_responses = None
+                            batch_decoded_responses = None
+
+                        batch_raw_prompts = batch.non_tensor_batch['raw_prompt']
+                        batch_raw_prompts = [item[0]["content"] for item in batch_raw_prompts]
+                        batch_raw_prompts = [item for item in batch_raw_prompts for _ in range(self.config.actor_rollout_ref.rollout.n)]
+                        
+                        records["global_step"].extend([self.global_steps] * len(batch_raw_prompts))
+                        records["raw_prompt"].extend(batch_raw_prompts)
+                        records["decoded_response"].extend(batch_decoded_responses)
 
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)
@@ -709,15 +709,15 @@ class RayPPOTrainer(object):
                         # the results from reward model and rule-based results.
                         if self.use_rm:
                             # we first compute reward model score
+                            # TO MYSELF: this is not exactly token-level score;
+                            # each of the the reward_tensor only has a response-level score.
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            # # print number of non-zero entries along last dimension
-                            # print(f"Number of non-zero reward entries: {(reward_tensor.batch['rm_scores'] != 0).sum(dim=-1)}")
-                            # print(f"Number of non-zero reward entries: {(reward_tensor.batch['rm_scores'] != 0).sum(dim=-1).shape}")
                             batch = batch.union(reward_tensor)
 
                         # we combine with rule-based rm
                         reward_tensor = self.reward_fn(batch)
                         batch.batch['token_level_scores'] = reward_tensor
+                        records["rm_score"].extend(batch.batch['token_level_scores'].sum(-1).tolist())
 
                         # compute rewards. apply_kl_penalty if available
                         # TO MYSELF: we do not apply kl penalty here for GRPO
@@ -745,6 +745,9 @@ class RayPPOTrainer(object):
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
+                    # if the global steps is greater than the critic warmup steps, then update the actor
+                    # this is used when we train the critic model, where we do not want to update the actor model while
+                    # the critic model just begin to train
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer('update_actor', timing_raw):
@@ -773,7 +776,7 @@ class RayPPOTrainer(object):
                     batch=batch, timing_raw=timing_raw))
 
                 # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
+                logger.log(data=metrics, step=self.global_steps, table_data=None)
 
                 self.global_steps += 1
 

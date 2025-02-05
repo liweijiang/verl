@@ -19,6 +19,8 @@ from enum import Enum
 from functools import partial
 from pathlib import Path
 from typing import List, Union, Dict, Any
+import pandas as pd
+import wandb
 
 
 class Tracking(object):
@@ -30,7 +32,8 @@ class Tracking(object):
         for backend in default_backend:
             if backend == 'tracking':
                 import warnings
-                warnings.warn("`tracking` logger is deprecated. use `wandb` instead.", DeprecationWarning)
+                warnings.warn(
+                    "`tracking` logger is deprecated. use `wandb` instead.", DeprecationWarning)
             else:
                 assert backend in self.supported_backend, f'{backend} is not supported'
 
@@ -38,7 +41,8 @@ class Tracking(object):
 
         if 'tracking' in default_backend or 'wandb' in default_backend:
             import wandb
-            wandb.init(project=project_name, name=experiment_name, config=config)
+            wandb.init(project=project_name,
+                       name=experiment_name, config=config)
             self.logger['wandb'] = wandb
 
         if 'mlflow' in default_backend:
@@ -52,10 +56,16 @@ class Tracking(object):
             self.console_logger = LocalLogger(print_to_console=True)
             self.logger['console'] = self.console_logger
 
-    def log(self, data, step, backend=None):
+    def log(self, data, step, backend=None, table_data=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
+
+                if logger_instance == self.logger['wandb']:
+                    if table_data is not None:
+                        df = pd.DataFrame(table_data)
+                        table = wandb.Table(dataframe=df)
+                        wandb.log({"rollout_examples": table})
 
     def __del__(self):
         if 'wandb' in self.logger:
@@ -77,7 +87,8 @@ def _compute_mlflow_params_from_objects(params) -> Dict[str, Any]:
 
 
 def _transform_params_to_json_serializable(x, convert_list_to_dict: bool):
-    _transform = partial(_transform_params_to_json_serializable, convert_list_to_dict=convert_list_to_dict)
+    _transform = partial(_transform_params_to_json_serializable,
+                         convert_list_to_dict=convert_list_to_dict)
 
     if dataclasses.is_dataclass(x):
         return _transform(dataclasses.asdict(x))
