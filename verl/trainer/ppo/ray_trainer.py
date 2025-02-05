@@ -776,7 +776,7 @@ class RayPPOTrainer(object):
                     batch=batch, timing_raw=timing_raw))
 
                 # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps, table_data=None)
+                logger.log(data=metrics, step=self.global_steps, table_data=records, max_num_table_samples=50000)
 
                 self.global_steps += 1
 

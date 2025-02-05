@@ -56,7 +56,7 @@ class Tracking(object):
             self.console_logger = LocalLogger(print_to_console=True)
             self.logger['console'] = self.console_logger
 
-    def log(self, data, step, backend=None, table_data=None):
+    def log(self, data, step, backend=None, table_data=None, max_num_table_samples=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
@@ -64,6 +64,9 @@ class Tracking(object):
                 if logger_instance == self.logger['wandb']:
                     if table_data is not None:
                         df = pd.DataFrame(table_data)
+                        if max_num_table_samples is not None:
+                            if len(table_data) > max_num_table_samples:
+                                df = df.sample(max_num_table_samples)
                         table = wandb.Table(dataframe=df)
                         wandb.log({"rollout_examples": table})
 

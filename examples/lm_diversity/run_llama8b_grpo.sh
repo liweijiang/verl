@@ -66,7 +66,8 @@ python3 -m verl.trainer.main_ppo \
 
     # reward_model.model.path=allenai/Llama-3.1-Tulu-3-8B-RM \
     # reward_model.model.input_tokenizer=allenai/Llama-3.1-Tulu-3-8B-RM \
-
+    # reward_model.model.path=nicolinho/QRM-Llama3.1-8B-v2 \
+    # reward_model.model.input_tokenizer=nicolinho/QRM-Llama3.1-8B-v2 \
 
 #   64 for 8B
 
