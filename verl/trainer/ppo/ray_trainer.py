@@ -633,12 +633,13 @@ class RayPPOTrainer(object):
 
         # we start from step 1
         self.global_steps += 1
-        records = {"global_step": [], "raw_prompt": [], "decoded_response": [], "rm_score": []}
+        global_records = {"global_step": [], "raw_prompt": [], "decoded_response": [], "rm_score": []}
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
+                records = {"global_step": [], "raw_prompt": [], "decoded_response": [], "rm_score": [], "diversity_score": []}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
@@ -713,6 +714,9 @@ class RayPPOTrainer(object):
                             # each of the the reward_tensor only has a response-level score.
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
+
+                        # print(batch)
+                        # print("=" * 100)
 
                         # we combine with rule-based rm
                         reward_tensor = self.reward_fn(batch)

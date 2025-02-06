@@ -350,12 +350,28 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
     if kl_penalty == "mse":
         return 0.5 * (logprob - ref_logprob).square()
 
-    # J. Schulman. Approximating kl divergence, 2020.
-    # # URL http://joschu.net/blog/kl-approx.html.
+    # This implements a low-variance approximation of KL divergence based on:
+    # J. Schulman. "Approximating the KL divergence between policy distributions", 2020
+    # http://joschu.net/blog/kl-approx.html
+    #
+    # The approximation is: KL ≈ exp(log p_ref - log p) - (log p_ref - log p) - 1
+    # Where:
+    # - p_ref is the reference policy probability
+    # - p is the current policy probability
+    # 
+    # This approximation has lower variance than directly computing KL divergence
+    # and is more numerically stable.
     if kl_penalty == 'low_var_kl':
+        # Compute log(p_ref) - log(p)
         kl = ref_logprob - logprob
+        
+        # Compute exp(log(p_ref) - log(p))
         ratio = torch.exp(kl)
+        
+        # Compute the approximation: exp(kl) - kl - 1
         kld = (ratio - kl - 1).contiguous()
+        
+        # Clamp values to avoid numerical instability
         return torch.clamp(kld, min=-10, max=10)
 
     if kl_penalty == "full":
