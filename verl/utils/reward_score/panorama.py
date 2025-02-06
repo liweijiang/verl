@@ -1,226 +1,142 @@
-from nltk.translate.bleu_score import sentence_bleu
-from nltk.tokenize import word_tokenize
-from sentence_transformers import SentenceTransformer
-import numpy as np
-import torch
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
-import os
+import sacrebleu
+import multiprocessing
 from functools import partial
+import numpy as np
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-
-def tokenize_responses(responses):
+def compute_bleu_for_one(candidate_idx, texts):
     """
-    Tokenize all responses once to avoid repeated tokenization.
-
+    Computes BLEU score for one sentence against all others in its group.
     Args:
-        responses (list): List of response strings
-
+        candidate_idx: Index of the candidate sentence within its group.
+        texts: List of text strings in the group.
     Returns:
-        list: List of tokenized responses
+        BLEU score for the candidate sentence.
     """
-    return [word_tokenize(response.lower().strip()) for response in responses]
+    candidate = texts[candidate_idx]
+    references = texts[:candidate_idx] + texts[candidate_idx+1:]
+
+    bleu_score = sacrebleu.sentence_bleu(
+        candidate,
+        references,
+        smooth_method="exp",
+        use_effective_order=True
+    ).score
+    return bleu_score
 
 
-def calculate_single_bleu(idx, tokenized_responses):
+def compute_group_self_bleu(group_texts):
     """
-    Calculate BLEU score for a single response against all others.
-
+    Computes Self-BLEU scores for a single group of texts.
     Args:
-        idx (int): Index of the candidate response
-        tokenized_responses (list): List of tokenized responses
-
+        group_texts: List of text strings.
     Returns:
-        float: BLEU score for the candidate
+        (scores, average): Tuple of individual scores and their average
     """
-    candidate = tokenized_responses[idx]
-    references = [resp for i, resp in enumerate(
-        tokenized_responses) if i != idx]
-
-    # Use weights for different n-grams (1-gram to 4-gram)
-    weights = (0.25, 0.25, 0.25, 0.25)
-
-    try:
-        return sentence_bleu(references, candidate, weights=weights)
-    except Exception as e:
-        print(f"Error calculating BLEU score for response {idx}: {e}")
-        return 0.0
+    group_size = len(group_texts)
+    scores = [compute_bleu_for_one(i, group_texts)
+              for i in range(group_size)]
+    return scores, np.mean(scores)
 
 
-def get_self_bleu_score(responses, num_workers=None):
+def compute_all_groups_self_bleu_parallel(all_texts, group_size=5, num_workers=4):
     """
-    Calculate the self-BLEU score of a list of responses using parallel processing.
-
+    Computes Self-BLEU scores for all groups in parallel.
     Args:
-        responses (list): List of response strings
-        num_workers (int, optional): Number of worker processes. Defaults to CPU count.
-
+        all_texts: List of strings.
+        group_size: Number of texts in each group.
+        num_workers: Number of parallel processes.
     Returns:
-        float: Average self-BLEU score
+        group_scores: List of (scores, average) tuples for each group.
     """
-    if len(responses) <= 1:
-        return 0.0
+    # Validate input
+    if len(all_texts) % group_size != 0:
+        raise ValueError(
+            f"Length of all_texts ({len(all_texts)}) must be divisible by group_size ({group_size})")
 
-    # Remove empty responses and strip whitespace
-    responses = [r.strip() for r in responses if r.strip()]
-    if not responses:
-        return 0.0
+    # Split texts into groups
+    groups = [all_texts[i:i+group_size]
+              for i in range(0, len(all_texts), group_size)]
 
-    # Tokenize all responses once
-    tokenized_responses = tokenize_responses(responses)
-
-    # Set up multiprocessing
-    if num_workers is None:
-        num_workers = mp.cpu_count()
-
-    # Ensure num_workers doesn't exceed number of responses
-    num_workers = min(num_workers, len(responses))
-
-    try:
-        # Create process pool and calculate BLEU scores in parallel
-        with mp.Pool(num_workers) as pool:
-            # Use partial to fix tokenized_responses argument
-            calc_bleu = partial(calculate_single_bleu,
-                                tokenized_responses=tokenized_responses)
-            # Calculate BLEU scores for all responses in parallel
-            bleu_scores = pool.map(calc_bleu, range(len(responses)))
-
-        # Calculate and return average BLEU score
-        return np.mean(bleu_scores)
-
-    except Exception as e:
-        print(f"Error in parallel processing: {e}")
-        # Fallback to sequential processing
-        bleu_scores = [calculate_single_bleu(i, tokenized_responses)
-                       for i in range(len(responses))]
-        return np.mean(bleu_scores)
-
-
-def get_pairwise_sentence_embedding_similarity(responses, is_return_matrix=False):
-    """
-    Calculate the pairwise sentence embedding similarity of a list of responses using a single GPU.
-
-    Args:
-        responses (list): List of text responses
-        is_return_matrix (bool): Whether to return the full similarity matrix
-
-    Returns:
-        float or numpy.ndarray: Average similarity or full similarity matrix
-    """
-    if len(responses) <= 1:
-        return 0.0 if not is_return_matrix else np.zeros((1, 1))
-
-    try:
-        # Check CUDA availability
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available")
-
-        device = torch.device("cuda:0")  # Use first GPU
-
-        # Initialize model
-        model = SentenceTransformer('all-MiniLM-L6-v2')
-        model = model.to(device)
-
-        # Get embeddings
-        embeddings = model.encode(
-            responses,
-            convert_to_tensor=True,
-            device=device
+    # Create pool and compute scores
+    with multiprocessing.Pool(num_workers) as pool:
+        group_scores = pool.map(
+            partial(compute_group_self_bleu),
+            groups
         )
-
-        # Move to CPU for numpy calculations
-        embeddings = embeddings.cpu().numpy()
-
-        # Calculate pairwise cosine similarity
-        norms = np.linalg.norm(embeddings, axis=1)
-        similarity_matrix = np.dot(
-            embeddings, embeddings.T) / np.outer(norms, norms)
-
-        # Handle numerical instabilities
-        similarity_matrix = np.clip(similarity_matrix, -1.0, 1.0)
-
-        if is_return_matrix:
-            return similarity_matrix
-        else:
-            # Exclude self-similarity from mean calculation
-            mask = ~np.eye(similarity_matrix.shape[0], dtype=bool)
-            return np.mean(similarity_matrix[mask])
-
-    except Exception as e:
-        print(f"Error in GPU similarity calculation: {str(e)}")
-        # Fallback to CPU
-        try:
-            print("Falling back to CPU processing...")
-            model = SentenceTransformer('all-MiniLM-L6-v2')
-            embeddings = model.encode(responses, convert_to_tensor=True)
-            embeddings = embeddings.cpu().numpy()
-
-            norms = np.linalg.norm(embeddings, axis=1)
-            similarity_matrix = np.dot(
-                embeddings, embeddings.T) / np.outer(norms, norms)
-            similarity_matrix = np.clip(similarity_matrix, -1.0, 1.0)
-
-            if is_return_matrix:
-                return similarity_matrix
-            else:
-                mask = ~np.eye(similarity_matrix.shape[0], dtype=bool)
-                return np.mean(similarity_matrix[mask])
-
-        except Exception as e:
-            print(f"CPU fallback also failed: {str(e)}")
-            return 0.0 if not is_return_matrix else np.zeros((len(responses), len(responses)))
+    return group_scores
 
 
-def get_diversity_scores_per_prompt(responses, score_types=['self_bleu_score', 'pairwise_sentence_embedding_similarity']):
-    """
-    Calculate the diversity score of a list of responses.
-    """
-    scores = {}
+def compute_score_all_types(all_texts, group_size, num_workers=4, is_average_across_prompts=True, score_types=['self_bleu_score']):
+    # , 'pairwise_sentence_embedding_similarity'
+    all_prompt_diversity_scores = {score_type: []
+                                   for score_type in score_types}
+
     if 'self_bleu_score' in score_types:
-        scores['self_bleu_score'] = get_self_bleu_score(responses)
-    if 'pairwise_sentence_embedding_similarity' in score_types:
-        scores['pairwise_sentence_embedding_similarity'] = get_pairwise_sentence_embedding_similarity(
-            responses)
-    return scores
+        group_scores = compute_all_groups_self_bleu_parallel(
+            all_texts,
+            group_size=group_size,
+            num_workers=num_workers
+        )           
+        for group_idx, (scores, avg) in enumerate(group_scores):
+            all_prompt_diversity_scores['self_bleu_score'].extend(scores)
 
-
-def compute_score(validation_data, is_average_across_prompts=True, score_types=['self_bleu_score', 'pairwise_sentence_embedding_similarity']):
-    all_prompt_diversity_scores = []
-    for prompt in validation_data:
-        responses = validation_data[prompt]
-        diversity_scores = get_diversity_scores_per_prompt(
-            responses, score_types)
-        all_prompt_diversity_scores.append(diversity_scores)
     if is_average_across_prompts:
-        metrics = {}
-        for prompt_scores in all_prompt_diversity_scores:
-            for key in prompt_scores:
-                if key not in metrics:
-                    metrics[key] = []
-                metrics[key].append(prompt_scores[key])
-        for key in metrics:
-            metrics[key] = np.mean(metrics[key])
-        return metrics
-
-    # else:
-    #     return all_prompt_diversity_scores
+        for score_type in score_types:
+            all_prompt_diversity_scores[score_type] = np.mean(
+                all_prompt_diversity_scores[score_type])
+        return all_prompt_diversity_scores
+    else:
+        return all_prompt_diversity_scores
 
 
+def compute_score(all_texts, group_size, score_type, num_workers=4, is_average_across_prompts=True):
+    all_scores = []
+    if score_type == 'self_bleu_score':
+        group_scores = compute_all_groups_self_bleu_parallel(
+            all_texts,
+            group_size=group_size,
+            num_workers=num_workers
+        )           
+        for group_idx, (scores, avg) in enumerate(group_scores):
+            all_scores.extend(scores)
+
+    if is_average_across_prompts:
+        return np.mean(all_scores)
+    else:
+        return all_scores
+
+
+# Example usage:
 if __name__ == '__main__':
-    validation_data = {
-        "Name three animals that symbolize resilience and briefly explain why.": [
-            "Here are three animals that symbolize resilience and the reasons why: 1. **Tortoise**: The tortoise is known for its ability to withstand harsh environments and survive for long periods without food or water. It also has a remarkable capacity to recover from injuries, making it a symbol of resilience. Its slow and steady approach to life is often seen as a model for perseverance and determination. 2. **Phoenix**: The phoenix is a mythical bird that is said to be born from its own ashes. When it dies, it is reborn, making it a symbol of transformation and resilience. The phoenix's ability to rise from the dead is seen as a powerful metaphor for overcoming adversity and finding strength in the face of challenge. 3. **Wolverine**: The wolverine is a small, fierce animal that is known for its tenacity and ability to adapt to harsh environments. It is also highly resilient, with the ability to survive in extreme cold and snow. Its determination and persistence in the face of adversity make it a symbol of resilience and a testament to the power of the human spirit. These animals embody the qualities of resilience, determination, and transformation, making them powerful symbols of hope and perseverance.",
-            "Here are three animals that symbolize resilience: 1. **Tortoise**: The tortoise is known for its slow and steady approach to life, but it's also incredibly resilient in the face of adversity. Its shell provides protection from predators, and it can survive for long periods without food or water. The tortoise's ability to persevere in challenging conditions has made it a symbol of endurance and resilience. 2. **Falcon**: The falcon is a bird of prey that is renowned for its remarkable adaptability and resilience. Despite facing many challenges, such as harsh weather conditions, competition for food, and predators, the falcon remains a powerful and efficient hunter. Its ability to thrive in a wide range of environments has earned it the nickname \"king of the skies.\" 3. **Hedgehog**: The hedgehog is often overlooked, but it's a remarkable example of resilience. Despite being small and vulnerable, hedgehogs can survive in a variety of environments, from forests to urban areas. Their ability to curl up into a ball for defense and their spiky quills make them difficult to harm, allowing them to thrive in the face of adversity.",
-            "Here are three animals that symbolize resilience: 1. **Cheetah**: Despite being one of the fastest land animals, cheetahs are also one of the most vulnerable species due to habitat loss, poaching, and human-wildlife conflict. However, they continue to thrive and adapt in the wild, demonstrating remarkable resilience in the face of adversity. 2. **Salmon**: Salmon are known for their remarkable migratory journey from the ocean to their birthplace in the river, a journey that can be up to 1,000 miles long. This incredible feat requires immense physical and mental resilience, as they face obstacles such as treacherous waters, predators, and habitat destruction along the way. 3. **Tortoise**: Tortoises are notorious for their slow and steady approach to life, but this comes with a remarkable level of resilience. Despite being small and vulnerable, they have survived for millions of years on our planet, facing threats such as habitat destruction, predators, and climate change. Their ability to adapt and thrive in a changing world makes them an icon of resilience."
-        ],
-        "Name three animals that symbolize resilience and briefly explain why.1": [
-            "Here are three animals that symbolize resilience and the reasons why: 1. **Tortoise**: The tortoise is known for its ability to withstand harsh environments and survive for long periods without food or water. It also has a remarkable capacity to recover from injuries, making it a symbol of resilience. Its slow and steady approach to life is often seen as a model for perseverance and determination. 2. **Phoenix**: The phoenix is a mythical bird that is said to be born from its own ashes. When it dies, it is reborn, making it a symbol of transformation and resilience. The phoenix's ability to rise from the dead is seen as a powerful metaphor for overcoming adversity and finding strength in the face of challenge. 3. **Wolverine**: The wolverine is a small, fierce animal that is known for its tenacity and ability to adapt to harsh environments. It is also highly resilient, with the ability to survive in extreme cold and snow. Its determination and persistence in the face of adversity make it a symbol of resilience and a testament to the power of the human spirit. These animals embody the qualities of resilience, determination, and transformation, making them powerful symbols of hope and perseverance.",
-            "Here are three animals that symbolize resilience: 1. **Tortoise**: The tortoise is known for its slow and steady approach to life, but it's also incredibly resilient in the face of adversity. Its shell provides protection from predators, and it can survive for long periods without food or water. The tortoise's ability to persevere in challenging conditions has made it a symbol of endurance and resilience. 2. **Falcon**: The falcon is a bird of prey that is renowned for its remarkable adaptability and resilience. Despite facing many challenges, such as harsh weather conditions, competition for food, and predators, the falcon remains a powerful and efficient hunter. Its ability to thrive in a wide range of environments has earned it the nickname \"king of the skies.\" 3. **Hedgehog**: The hedgehog is often overlooked, but it's a remarkable example of resilience. Despite being small and vulnerable, hedgehogs can survive in a variety of environments, from forests to urban areas. Their ability to curl up into a ball for defense and their spiky quills make them difficult to harm, allowing them to thrive in the face of adversity.",
-            "Here are three animals that symbolize resilience: 1. **Cheetah**: Despite being one of the fastest land animals, cheetahs are also one of the most vulnerable species due to habitat loss, poaching, and human-wildlife conflict. However, they continue to thrive and adapt in the wild, demonstrating remarkable resilience in the face of adversity. 2. **Salmon**: Salmon are known for their remarkable migratory journey from the ocean to their birthplace in the river, a journey that can be up to 1,000 miles long. This incredible feat requires immense physical and mental resilience, as they face obstacles such as treacherous waters, predators, and habitat destruction along the way. 3. **Tortoise**: Tortoises are notorious for their slow and steady approach to life, but this comes with a remarkable level of resilience. Despite being small and vulnerable, they have survived for millions of years on our planet, facing threats such as habitat destruction, predators, and climate change. Their ability to adapt and thrive in a changing world makes them an icon of resilience."
-        ]
-    }
+    # Example list of texts (multiple groups)
+    all_texts = [
+        # Group 1
+        "The quick brown fox jumps over the lazy dog.",
+        "A fast, brown fox leaps across a sleepy canine.",
+        "The rapid fox swiftly jumps over the sluggish dog.",
+        "An energetic fox hops over a dozing dog.",
+        "A brown fox jumped over a lazy sleeping dog.",
+        # Group 2
+        "The cat sits on the windowsill watching birds.",
+        "A feline perches near the window observing avians.",
+        "The kitty is stationed at the window eyeing birds.",
+        "A cat lounges by the windowsill looking at birds.",
+        "The feline rests near the window watching flying creatures.",
+    ] * (512)
 
-    print(compute_score(validation_data, is_average_across_prompts=True,
-                        score_types=['self_bleu_score', 'pairwise_sentence_embedding_similarity']))
+    group_scores = compute_all_groups_self_bleu_parallel(
+        all_texts,
+        group_size=5,  # Now configurable
+        num_workers=4
+    )
+
+    # # Print results
+    # for group_idx, (scores, avg) in enumerate(group_scores):
+    #     print(f"\nGroup {group_idx + 1}:")
+    #     for i, score in enumerate(scores):
+    #         print(f"Self-BLEU for sentence {i+1}: {score:.2f}")
+    #     print(f"Group average Self-BLEU: {avg:.2f}")
+
+    print(compute_score(all_texts, group_size=5, num_workers=4, is_average_across_prompts=False))
+    

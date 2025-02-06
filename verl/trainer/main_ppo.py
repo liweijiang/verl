@@ -15,19 +15,19 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
 
+import hydra
+import ray
 from verl import DataProto
 import torch
 from verl.utils.reward_score import gsm8k, math_dataset, panorama
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
 
 def _default_compute_score(data_source, solution_str, ground_truth):
     if data_source == 'openai/gsm8k':
         return gsm8k.compute_score(solution_str, ground_truth)
     elif data_source in ['lighteval/MATH', 'DigitalLearningGmbH/MATH-lighteval']:
         return math_dataset.compute_score(solution_str, ground_truth)
-    elif data_source == 'panorama':
-        score_types = ['self_bleu_score', 'pairwise_sentence_embedding_similarity']
-        return panorama.compute_score(data_source, is_average_across_prompts=True, score_types=score_types)
     else:
         raise NotImplementedError
 
@@ -38,7 +38,8 @@ class RewardManager():
 
     def __init__(self, tokenizer, num_examine, compute_score=None) -> None:
         self.tokenizer = tokenizer
-        self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
+        # the number of batches of decoded responses to print to the console
+        self.num_examine = num_examine
         self.compute_score = compute_score or _default_compute_score
 
     def __call__(self, data: DataProto):
@@ -48,7 +49,8 @@ class RewardManager():
         if 'rm_scores' in data.batch.keys():
             return data.batch['rm_scores']
 
-        reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        reward_tensor = torch.zeros_like(
+            data.batch['responses'], dtype=torch.float32)
 
         already_print_data_sources = {}
 
@@ -59,11 +61,13 @@ class RewardManager():
 
             prompt_length = prompt_ids.shape[-1]
 
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum(
+            )
             valid_prompt_ids = prompt_ids[-valid_prompt_length:]
 
             response_ids = data_item.batch['responses']
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum(
+            )
             valid_response_ids = response_ids[:valid_response_length]
 
             # decode
@@ -95,63 +99,32 @@ class DiversityRewardManager():
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine, compute_score=None) -> None:
+    def __init__(self, tokenizer, num_examine, compute_score=None, group_size=5, num_workers=4) -> None:
         self.tokenizer = tokenizer
-        self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
-        self.compute_score = compute_score or _default_compute_score
+        # the number of batches of decoded responses to print to the console
+        self.num_examine = num_examine
+        self.compute_score = compute_score or panorama.compute_score
+        self.group_size = group_size
+        self.num_workers = num_workers
 
-    def __call__(self, data: DataProto):
-        """We will expand this function gradually based on the available datasets"""
+    def __call__(self, data: DataProto, responses, score_type):
+        reward_tensor = torch.zeros_like(
+            data.batch['responses'], dtype=torch.float32)
 
-        # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        if 'rm_scores' in data.batch.keys():
-            return data.batch['rm_scores']
-
-        reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
-
-        already_print_data_sources = {}
+        scores = self.compute_score(
+            responses, group_size=self.group_size, num_workers=self.num_workers, is_average_across_prompts=False, score_type=score_type)
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
-
             prompt_ids = data_item.batch['prompts']
-
             prompt_length = prompt_ids.shape[-1]
-
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
-            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
-
-            response_ids = data_item.batch['responses']
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-
-            # decode
-            sequences = torch.cat((valid_prompt_ids, valid_response_ids))
-            sequences_str = self.tokenizer.decode(sequences)
-
-            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
-
-            data_source = data_item.non_tensor_batch['data_source']
-
-            score = self.compute_score(
-                data_source=data_source,
-                solution_str=sequences_str,
-                ground_truth=ground_truth,
+            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum(
             )
-            reward_tensor[i, valid_response_length - 1] = score
+            reward_tensor[i, valid_response_length - 1] = scores[i]
 
-            if data_source not in already_print_data_sources:
-                already_print_data_sources[data_source] = 0
-
-            if already_print_data_sources[data_source] < self.num_examine:
-                already_print_data_sources[data_source] += 1
-                print(sequences_str)
-
+            if i < self.num_examine:
+                print(data_item.batch['responses'])
         return reward_tensor
-
-        
-import ray
-import hydra
 
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
@@ -162,7 +135,8 @@ def main(config):
 def run_ppo(config, compute_score=None):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray.init(runtime_env={'env_vars': {
+                 'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
 
     ray.get(main_task.remote(config, compute_score))
 
@@ -175,7 +149,8 @@ def main_task(config, compute_score=None):
     # print initial config
     from pprint import pprint
     from omegaconf import OmegaConf
-    pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
+    # resolve=True will eval symbol values
+    pprint(OmegaConf.to_container(config, resolve=True))
     OmegaConf.resolve(config)
 
     # download the checkpoint from hdfs
@@ -237,12 +212,15 @@ def main_task(config, compute_score=None):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
-    reward_fn = DiversityRewardManager(tokenizer=tokenizer, num_examine=0, compute_score=compute_score)
+    reward_fn = DiversityRewardManager(
+        tokenizer=tokenizer, num_examine=0, compute_score=compute_score, group_size=config.actor_rollout_ref.rollout.n, num_workers=config.diversity_reward.num_workers)
 
     # Note that we always use function-based RM for validation
-    val_reward_fn = DiversityRewardManager(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
+    val_reward_fn = DiversityRewardManager(
+        tokenizer=tokenizer, num_examine=1, compute_score=compute_score, group_size=config.actor_rollout_ref.rollout.n, num_workers=config.diversity_reward.num_workers)
 
-    resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+    resource_pool_manager = ResourcePoolManager(
+        resource_pool_spec=resource_pool_spec, mapping=mapping)
 
     trainer = RayPPOTrainer(config=config,
                             tokenizer=tokenizer,

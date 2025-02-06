@@ -199,6 +199,14 @@ class DataProto:
         non_tensor_data = {key: val[item] for key, val in self.non_tensor_batch.items()}
         return DataProtoItem(batch=tensor_data, non_tensor_batch=non_tensor_data, meta_info=self.meta_info)
 
+    def unpad(self, pad_size):
+        if self.batch is not None:
+            self.batch = self.batch[:-pad_size]
+        if self.non_tensor_batch is not None:
+            for key, val in self.non_tensor_batch.items():
+                self.non_tensor_batch[key] = val[:-pad_size]
+        return self
+
     def __getstate__(self):
         import io
         buffer = io.BytesIO()

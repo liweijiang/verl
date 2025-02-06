@@ -164,5 +164,16 @@ trainer:
   save_freq: -1
   test_freq: -1
   critic_warmup: 0
-  default_hdfs_dir: ~/experiments/gsm8k/ppo/${trainer.experiment_name}
+  default_hdfs_dir: ~/experiments/lm_diversity/grpo/${trainer.experiment_name}
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+
+diversity_reward:
+  enable: True
+  score_types: [self_bleu_score]
+  diversity_reward_coef: 0.1
+  num_workers: 4
+  eval:
+    temperature: 1
+    top_k: -1
+    top_p: 0.9
+    n: 20
