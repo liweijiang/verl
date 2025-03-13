@@ -164,6 +164,7 @@ trainer:
   save_freq: -1
   test_freq: -1
   critic_warmup: 0
+  val_before_train: True
   default_hdfs_dir: ~/experiments/lm_diversity/grpo/${trainer.experiment_name}
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
 

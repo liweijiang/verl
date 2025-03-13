@@ -357,7 +357,7 @@ class RayPPOTrainer(object):
             self.kl_ctrl = core_algos.FixedKLController(kl_coef=0.)
 
         self.global_records = {"global_step": [], "raw_prompt": [
-        ], "decoded_response": [], "rm_score": []}
+        ], "decoded_response": [], "rm_score": [], self.config.diversity_reward.score_types[0]: []}
 
         self._validate_config()
         self._create_dataloader()
@@ -609,17 +609,27 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
-    def _validate_diversity(self, score_types=["self_bleu_score"]):
+    def _validate_diversity(self, score_types=["self_bleu_score"], is_eval_rm=True):
         """
         Validate the the diversity of the generated responses on the validation set.
         """
+        validation_records = {k: [] for k in self.global_records.keys()}
         reward_tensor_lst = {score_type: [] for score_type in score_types}
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
             # test_batch = test_batch.to('cuda')
 
+            print("9" * 100)
+            print(test_batch.batch)
+            print("9" * 100)
+
             test_gen_batch = test_batch.pop(
                 ['input_ids', 'attention_mask', 'position_ids'])
+
+            print("0" * 100)
+            print(test_batch.batch)
+            print("0" * 100)
+
             test_gen_batch.meta_info = {
                 'eos_token_id': self.tokenizer.eos_token_id,
                 'pad_token_id': self.tokenizer.pad_token_id,
@@ -635,13 +645,63 @@ class RayPPOTrainer(object):
             test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(
                 test_gen_batch_padded)
 
+            # print("2" * 100)
+            # print(test_output_gen_batch_padded)
+            # print("2" * 100)
+
+            # print("$" * 100)
+            # print(test_gen_batch_padded)
+            # print("$" * 100)
+
+            test_gen_batch_padded.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(
+                test_gen_batch_padded.batch["input_ids"].shape[0])], dtype=object)
+            # repeat to align with repeated responses in rollout
+            test_gen_batch_padded = test_gen_batch_padded.repeat(
+                repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+
+
+            # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+            #                                          dtype=object)
+            # # repeat to align with repeated responses in rollout
+            # batch = batch.repeat(
+            #     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+            # batch = batch.union(gen_batch_output)
+
+            print("3" * 100)
+            print(test_gen_batch_padded)
+            print("3" * 100)
+
+
+            print("2" * 100)
+            print(test_output_gen_batch_padded)
+            print("2" * 100)
+
+
+
+            # print("3" * 100)
+            # print(test_gen_batch_padded)
+            # print("3" * 100)
+            test_gen_batch_padded = test_gen_batch_padded.union(
+                test_output_gen_batch_padded)
+
+            print("*" * 100)
+            for k in test_gen_batch_padded.non_tensor_batch:
+                print(
+                    f"{k}: {test_gen_batch_padded.non_tensor_batch[k].shape}")
+            print("+" * 100)
+            for k in test_gen_batch_padded.batch:
+                print(f"{k}: {test_gen_batch_padded.batch[k].shape}")
+            print("*" * 100)
+
             # unpad
-            test_output_gen_batch = test_output_gen_batch_padded.unpad(pad_size=pad_size * self.config.actor_rollout_ref.rollout.n)
+            test_output_gen_batch = test_output_gen_batch_padded.unpad(
+                pad_size=pad_size * self.config.actor_rollout_ref.rollout.n)
             print('validation generation end')
 
             # decode responses if indicated
             test_batch_decoded_responses = self.tokenizer.batch_decode(
                 test_output_gen_batch.batch['responses'], skip_special_tokens=True)
+
 
             for score_type in score_types:
                 # evaluate using reward_function
@@ -649,15 +709,43 @@ class RayPPOTrainer(object):
                 reward_tensor = self.val_reward_fn(
                     test_output_gen_batch, test_batch_decoded_responses, score_type=score_type)
                 reward_tensor_lst[score_type].append(reward_tensor)
-        
+
+            test_batch_raw_prompts = test_batch.non_tensor_batch['raw_prompt']
+            test_batch_raw_prompts = [item[0]["content"]
+                                      for item in test_batch_raw_prompts]
+            test_batch_raw_prompts = [item for item in test_batch_raw_prompts for _ in range(
+                self.config.actor_rollout_ref.rollout.n)]
+
+            validation_records["global_step"].extend(
+                [self.global_steps] * len(test_batch_raw_prompts))
+            validation_records["raw_prompt"].extend(test_batch_raw_prompts)
+            validation_records["decoded_response"].extend(
+                test_batch_decoded_responses)
+
         reward_tensor_cat = {score_type: torch.cat(
             reward_tensor_lst[score_type], dim=0).sum(-1).cpu().numpy() for score_type in score_types}
 
         metric_dict = {}
         for score_type in reward_tensor_cat:
-            metric_dict[f'val/test_score/{score_type}'] = np.mean(reward_tensor_cat[score_type])
+            metric_dict[f'val/test_score/{score_type}'] = np.mean(
+                reward_tensor_cat[score_type])
 
-        return metric_dict
+            validation_records[score_type] = reward_tensor_cat[score_type].tolist(
+            )
+
+        return metric_dict, validation_records
+
+    # def _validate_reward_function(self):
+    #     """
+    #     Validate the reward function on the validation set.
+    #     """
+    #     reward_tensor_lst = []
+    #     for test_data in self.val_dataloader:
+    #         test_batch = DataProto.from_single_dict(test_data)
+    #         reward_tensor = self.rm_wg.compute_rm_score(test_batch)
+    #         reward_tensor_lst.append(reward_tensor.batch["rm_scores"])
+    #     reward_tensor_cat = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu().numpy()
+    #     return np.mean(reward_tensor_cat), reward_tensor_cat.tolist()
 
     def _add_to_global_records(self, records):
         for key in records.keys():
@@ -682,11 +770,25 @@ class RayPPOTrainer(object):
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
-            val_metrics = self._validate_diversity(score_types=self.config.diversity_reward.score_types)
+            val_metrics, val_records = self._validate_diversity(
+                score_types=self.config.diversity_reward.score_types)
+            # rm_score, rm_score_lst = self._validate_reward_function()
+            # val_metrics[f'val/test_score/rm_score'] = rm_score
+            # val_records["rm_score"].extend(rm_score_lst)
+
             pprint(f'Initial validation metrics: {val_metrics}')
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get('val_only', False):
                 return
+
+        # for k in val_records:
+        #     print(f'{k}: {len(val_records[k])}')
+        #     print("+"*100)
+
+        # print("-"*100)
+        # print(val_metrics)
+
+        # return
 
         # we start from step 1
         self.global_steps += 1
@@ -695,14 +797,13 @@ class RayPPOTrainer(object):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
-                records = {"global_step": [], "raw_prompt": [
-                ], "decoded_response": [], "rm_score": [], "diversity_score": []}
+                records = {k: [] for k in self.global_records.keys()}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
                 gen_batch = batch.pop(
-                    batch_keys=['input_ids', 'attention_mask', 'position_ids'])  # , 'raw_prompt'
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'])
 
                 with _timer('step', timing_raw):
                     # generate a batch
@@ -717,24 +818,28 @@ class RayPPOTrainer(object):
                         else:
                             batch_decoded_responses = None
 
-                        batch_raw_prompts = batch.non_tensor_batch['raw_prompt']
-                        batch_raw_prompts = [item[0]["content"]
-                                             for item in batch_raw_prompts]
-                        batch_raw_prompts = [item for item in batch_raw_prompts for _ in range(
-                            self.config.actor_rollout_ref.rollout.n)]
-
-                        records["global_step"].extend(
-                            [self.global_steps] * len(batch_raw_prompts))
-                        records["raw_prompt"].extend(batch_raw_prompts)
-                        records["decoded_response"].extend(
-                            batch_decoded_responses)
-
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(
                         repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+
+                    print("3" * 100)
+                    print(batch.batch)
+                    print("3" * 100)
+
+
+                    # print("2" * 100)
+                    # print(gen_batch_output)
+                    # print("2" * 100)
+
                     batch = batch.union(gen_batch_output)
+
+                    records["global_step"].extend(
+                        [self.global_steps] * batch.non_tensor_batch["raw_prompt"].shape[0])
+                    records["raw_prompt"].extend(
+                        batch.non_tensor_batch["raw_prompt"].tolist())
+                    records["decoded_response"].extend(batch_decoded_responses)
 
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
@@ -775,12 +880,17 @@ class RayPPOTrainer(object):
                             # each of the the reward_tensor only has a response-level score.
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
+                            batch.batch['token_level_scores'] = reward_tensor.batch["rm_scores"]
+                            records["rm_score"].extend(
+                                batch.batch['token_level_scores'].sum(-1).tolist())
 
-                        # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
-                        records["rm_score"].extend(
-                            batch.batch['token_level_scores'].sum(-1).tolist())
+                        # diversity reward
+                        if self.config.diversity_reward.enable:
+                            diversity_reward_tensor = self.val_reward_fn(
+                                batch, batch_decoded_responses, score_type=self.config.diversity_reward.score_types[0])
+                            batch.batch['diversity_reward_tensor'] = diversity_reward_tensor
+                            records[self.config.diversity_reward.score_types[0]].extend(
+                                batch.batch['diversity_reward_tensor'].sum(-1).tolist())
 
                         self._add_to_global_records(records)
 
@@ -826,7 +936,8 @@ class RayPPOTrainer(object):
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
                             self.global_steps % self.config.trainer.test_freq == 0:
                         with _timer('testing', timing_raw):
-                            val_metrics: dict = self._validate()
+                            val_metrics: dict = self._validate_diversity(
+                                score_types=self.config.diversity_reward.score_types)
                         metrics.update(val_metrics)
 
                     if self.config.trainer.save_freq > 0 and \
